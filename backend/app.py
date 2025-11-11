@@ -224,14 +224,14 @@ def bandwidth_calculator():
                         bytes_recv_delta = traffic['bytes_recv'] - traffic['prev_bytes_recv']
                         
                         # Calcola bandwidth (bytes per second)
-                        bandwidth_sent = bytes_sent_delta / time_delta
-                        bandwidth_recv = bytes_recv_delta / time_delta
+                        bandwidth_sent = max(0, bytes_sent_delta / time_delta)
+                        bandwidth_recv = max(0, bytes_recv_delta / time_delta)
                         bandwidth_total = bandwidth_sent + bandwidth_recv
                         
                         # Aggiorna i valori cached
-                        traffic['bandwidth_total'] = max(0, bandwidth_total)
-                        traffic['bandwidth_sent'] = max(0, bandwidth_sent)
-                        traffic['bandwidth_recv'] = max(0, bandwidth_recv)
+                        traffic['bandwidth_total'] = bandwidth_total
+                        traffic['bandwidth_sent'] = bandwidth_sent
+                        traffic['bandwidth_recv'] = bandwidth_recv
                         
                         # Aggiorna i valori precedenti
                         traffic['prev_bytes_sent'] = traffic['bytes_sent']
