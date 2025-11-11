@@ -11,9 +11,13 @@ interface Device {
   bytes_recv: number;
   packets_sent: number;
   packets_recv: number;
-  bandwidth_used: number;
+  bandwidth_used: number;  // SMOOTHED (per legenda e lista)
+  bandwidth_used_instant?: number;  // ✅ NUOVO: ISTANTANEO (per il grafico)
   bandwidth_sent: number;
   bandwidth_recv: number;
+  is_active?: boolean;
+  connection_count?: number;
+  first_seen?: number;
 }
 
 interface NetworkStats {
@@ -22,7 +26,13 @@ interface NetworkStats {
   total_bandwidth_devices: number;
   devices: Device[];
   timestamp: string;
-  sniffer_active: boolean;
+  sniffer_active?: boolean;
+  monitoring_active?: boolean;
+  scanner_active?: boolean;
+  packets_captured?: number;
+  scapy_available?: boolean;
+  last_deep_scan?: string;
+  next_deep_scan_in?: number;
 }
 
 interface ChartDataPoint {
@@ -82,16 +92,19 @@ const Dashboard: React.FC = () => {
         timestamp: Date.now()
       };
       
-      let currentMaxBandwidth = 0;
+      let currentMaxDeviceBandwidth = 0;
       const newDeviceHostnames = new Set<string>();
       
       data.devices.forEach((device: Device) => {
+        // ✅ USA bandwidth_used (SMOOTHED) per il grafico
+        // Il backend ora restituisce il valore smoothed in bandwidth_used
+        // che è quello che vogliamo tracciare
         newDataPoint[device.hostname] = device.bandwidth_used;
         newDeviceHostnames.add(device.hostname);
         
-        // Track max bandwidth
-        if (device.bandwidth_used > currentMaxBandwidth) {
-          currentMaxBandwidth = device.bandwidth_used;
+        // Track max bandwidth usando il valore smoothed
+        if (device.bandwidth_used > currentMaxDeviceBandwidth) {
+          currentMaxDeviceBandwidth = device.bandwidth_used;
         }
         
         // Auto-add devices with traffic to visible list
@@ -107,11 +120,11 @@ const Dashboard: React.FC = () => {
         }
       });
       
-      // Update all device IPs
+      // Update all device hostnames
       setAllDeviceIPs(newDeviceHostnames);
       
-      // Update max bandwidth
-      setMaxBandwidth(prev => Math.max(prev, currentMaxBandwidth));
+      // Update the overall max bandwidth peak
+      setMaxBandwidth(prevMax => Math.max(prevMax, currentMaxDeviceBandwidth));
       
       // Update chart data
       setChartData(prevData => {
@@ -128,13 +141,13 @@ const Dashboard: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [isPaused]); // SOLO isPaused come dependency
+  }, [isPaused]);
 
   useEffect(() => {
     fetchNetworkStats();
     const interval = setInterval(fetchNetworkStats, refreshRate);
     return () => clearInterval(interval);
-  }, [refreshRate, fetchNetworkStats]); // refreshRate e fetchNetworkStats
+  }, [refreshRate, isPaused, fetchNetworkStats]);
 
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B';
@@ -150,6 +163,7 @@ const Dashboard: React.FC = () => {
 
   const getSortedDevices = (): Device[] => {
     if (!networkStats) return [];
+    // Ordina per bandwidth smoothed decrescente
     return [...networkStats.devices].sort((a, b) => b.bandwidth_used - a.bandwidth_used);
   };
 
@@ -186,6 +200,8 @@ const Dashboard: React.FC = () => {
 
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload && payload.length) {
+      const sortedPayload = [...payload].sort((a, b) => b.value - a.value);
+      
       return (
         <motion.div 
           className="custom-tooltip"
@@ -193,7 +209,7 @@ const Dashboard: React.FC = () => {
           animate={{ opacity: 1, scale: 1 }}
         >
           <div className="tooltip-header">{label}</div>
-          {payload.map((entry: any, index: number) => (
+          {sortedPayload.map((entry: any, index: number) => (
             <div key={index} className="tooltip-row">
               <span className="tooltip-dot" style={{ backgroundColor: entry.color }}></span>
               <span className="tooltip-label">{entry.name}</span>
@@ -243,6 +259,7 @@ const Dashboard: React.FC = () => {
   }
 
   const sortedDevices = getSortedDevices();
+  const chartYAxisDomain = [0, maxBandwidth > 1024 ? 'auto' : 1024];
 
   return (
     <div className="dashboard">
@@ -255,10 +272,20 @@ const Dashboard: React.FC = () => {
         <div className="header-content">
           <h1 className="header-title">NETWORK TRAFFIC MONITORING SYSTEM</h1>
           <div className="header-meta">
-            <span className={`status-indicator ${isPaused ? 'paused' : ''} ${networkStats?.sniffer_active ? 'active' : 'inactive'}`}></span>
+            <span className={`status-indicator ${isPaused ? 'paused' : ''} ${networkStats?.sniffer_active || networkStats?.monitoring_active || networkStats?.scanner_active ? 'active' : 'inactive'}`}></span>
             <span className="header-timestamp">
               {networkStats?.timestamp ? new Date(networkStats.timestamp).toLocaleString() : 'OFFLINE'}
             </span>
+            {networkStats?.packets_captured !== undefined && (
+              <span className="header-packets">
+                📦 {networkStats.packets_captured.toLocaleString()} packets
+              </span>
+            )}
+            {networkStats?.next_deep_scan_in !== undefined && networkStats.next_deep_scan_in > 0 && (
+              <span className="header-scan-timer">
+                🔍 Next scan: {Math.floor(networkStats.next_deep_scan_in / 60)}m {networkStats.next_deep_scan_in % 60}s
+              </span>
+            )}
           </div>
         </div>
 
@@ -306,7 +333,7 @@ const Dashboard: React.FC = () => {
           { 
             label: 'TOTAL BANDWIDTH', 
             value: networkStats ? formatBandwidth(networkStats.total_bandwidth) : '0 B/s',
-            subtitle: `System: ${networkStats ? formatBandwidth(networkStats.total_bandwidth_system) : '0 B/s'}`,
+            subtitle: `Devices: ${networkStats ? formatBandwidth(networkStats.total_bandwidth_devices) : '0 B/s'}`,
             color: '#FF3B30',
             icon: '▲'
           },
@@ -360,8 +387,8 @@ const Dashboard: React.FC = () => {
         </div>
 
         <div className="legend-controls">
-          {Array.from(allDeviceIPs).map((hostname, index) => {
-            const device = networkStats?.devices.find(d => d.hostname === hostname);
+          {sortedDevices.map((device, index) => {
+            const hostname = device.hostname;
             const isVisible = visibleDevices.has(hostname);
             const isHovered = hoveredDevice === hostname;
             
@@ -377,11 +404,11 @@ const Dashboard: React.FC = () => {
               >
                 <div
                   className="legend-color-dot"
-                  style={{ backgroundColor: DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length] }}
+                  style={{ backgroundColor: getDeviceColor(hostname) }}
                 ></div>
                 <span className="legend-name">{hostname}</span>
                 <span className="legend-value">
-                  {device ? formatBandwidth(device.bandwidth_used) : '0 B/s'}
+                  {formatBandwidth(device.bandwidth_used)}
                 </span>
               </motion.div>
             );
@@ -425,6 +452,8 @@ const Dashboard: React.FC = () => {
                   tickLine={false}
                   axisLine={{ stroke: '#333333' }}
                   tickFormatter={(value) => formatBandwidth(value)}
+                  domain={chartYAxisDomain}
+                  allowDataOverflow={true}
                 />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend 
@@ -462,7 +491,7 @@ const Dashboard: React.FC = () => {
       >
         <div className="section-header">
           <div className="section-title">RESOURCE ALLOCATION</div>
-          <div className="section-meta">SORTED BY BANDWIDTH CONSUMPTION</div>
+          <div className="section-meta">SORTED BY BANDWIDTH CONSUMPTION (HIGH → LOW)</div>
         </div>
 
         {sortedDevices.length === 0 ? (
@@ -499,6 +528,12 @@ const Dashboard: React.FC = () => {
                     <span className="device-detail">{device.ip}</span>
                     <span className="device-separator">·</span>
                     <span className="device-detail">{device.mac}</span>
+                    {device.connection_count !== undefined && device.connection_count > 0 && (
+                      <>
+                        <span className="device-separator">·</span>
+                        <span className="device-detail">{device.connection_count} conn</span>
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -596,6 +631,20 @@ const Dashboard: React.FC = () => {
                     <div className="stat-label">Total Data Received</div>
                     <div className="stat-value">{formatBytes(selectedDevice.bytes_recv)}</div>
                   </div>
+                  {selectedDevice.connection_count !== undefined && (
+                    <div className="stat-box">
+                      <div className="stat-label">Active Connections</div>
+                      <div className="stat-value">{selectedDevice.connection_count}</div>
+                    </div>
+                  )}
+                  {selectedDevice.first_seen !== undefined && selectedDevice.first_seen > 0 && (
+                    <div className="stat-box">
+                      <div className="stat-label">First Seen</div>
+                      <div className="stat-value">
+                        {new Date(selectedDevice.first_seen * 1000).toLocaleString()}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </motion.div>
