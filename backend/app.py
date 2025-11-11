@@ -10,9 +10,17 @@ import re
 import platform
 from threading import Lock, Thread
 from scapy.all import sniff, IP, get_if_list
+import logging
 
 app = Flask(__name__)
 CORS(app)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Thread-safe locks
 stats_lock = Lock()
@@ -29,9 +37,12 @@ device_traffic = defaultdict(lambda: {
     'packets_sent': 0,
     'packets_recv': 0,
     'last_update': time.time(),
-    'prev_bytes_sent': 0,  # Per calcolare delta
-    'prev_bytes_recv': 0,  # Per calcolare delta
-    'prev_time': time.time()  # Per calcolare bandwidth
+    'prev_bytes_sent': 0,
+    'prev_bytes_recv': 0,
+    'prev_time': time.time(),
+    'bandwidth_total': 0,  # NUOVO: cache bandwidth
+    'bandwidth_sent': 0,   # NUOVO: cache bandwidth sent
+    'bandwidth_recv': 0    # NUOVO: cache bandwidth recv
 })
 
 # Cache for discovered devices
@@ -43,6 +54,11 @@ CACHE_TIMEOUT = 600
 # Packet sniffing control
 sniffer_running = False
 sniffer_thread = None
+packet_count = 0
+
+# Bandwidth calculation thread
+bandwidth_thread = None
+bandwidth_running = False
 
 def get_local_ip():
     """Get the local IP address of the machine"""
@@ -78,7 +94,7 @@ def get_network_interface():
                 return iface
                 
     except Exception as e:
-        print(f"⚠️ Error getting network interface: {e}")
+        logger.error(f"⚠️ Error getting network interface: {e}")
     
     return None
 
@@ -147,14 +163,19 @@ def get_arp_table():
                 if ip.startswith(f'{network_prefix}.') and not ip.endswith('.255'):
                     devices_info[ip] = mac.upper()
     except Exception as e:
-        print(f"⚠️ ARP table error: {e}")
+        logger.error(f"⚠️ ARP table error: {e}")
     
     return devices_info
 
 def packet_callback(packet):
     """Callback function for each captured packet"""
+    global packet_count
     try:
         if IP in packet:
+            packet_count += 1
+            if packet_count % 1000 == 0:
+                logger.info(f"📦 Captured {packet_count} packets")
+            
             src_ip = packet[IP].src
             dst_ip = packet[IP].dst
             packet_size = len(packet)
@@ -174,8 +195,75 @@ def packet_callback(packet):
                     device_traffic[dst_ip]['packets_recv'] += 1
                     device_traffic[dst_ip]['last_update'] = time.time()
                     
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error in packet_callback: {e}")
+
+def bandwidth_calculator():
+    """Background thread to calculate bandwidth every second"""
+    global bandwidth_running
+    
+    logger.info("🔄 Bandwidth calculator started")
+    
+    while bandwidth_running:
+        try:
+            current_time = time.time()
+            
+            with sniffer_lock:
+                for ip, traffic in device_traffic.items():
+                    # Se non ci sono dati, skip
+                    if traffic['bytes_sent'] == 0 and traffic['bytes_recv'] == 0:
+                        continue
+                    
+                    # Calcola time delta
+                    time_delta = current_time - traffic['prev_time']
+                    
+                    # Calcola solo se è passato almeno 1 secondo
+                    if time_delta >= 1.0:
+                        # Calcola i delta
+                        bytes_sent_delta = traffic['bytes_sent'] - traffic['prev_bytes_sent']
+                        bytes_recv_delta = traffic['bytes_recv'] - traffic['prev_bytes_recv']
+                        
+                        # Calcola bandwidth (bytes per second)
+                        bandwidth_sent = bytes_sent_delta / time_delta
+                        bandwidth_recv = bytes_recv_delta / time_delta
+                        bandwidth_total = bandwidth_sent + bandwidth_recv
+                        
+                        # Aggiorna i valori cached
+                        traffic['bandwidth_total'] = max(0, bandwidth_total)
+                        traffic['bandwidth_sent'] = max(0, bandwidth_sent)
+                        traffic['bandwidth_recv'] = max(0, bandwidth_recv)
+                        
+                        # Aggiorna i valori precedenti
+                        traffic['prev_bytes_sent'] = traffic['bytes_sent']
+                        traffic['prev_bytes_recv'] = traffic['bytes_recv']
+                        traffic['prev_time'] = current_time
+                        
+                        # Debug log
+                        if bandwidth_total > 0:
+                            logger.debug(f"📊 {ip}: {bandwidth_total:.2f} B/s")
+            
+            time.sleep(1)  # Calcola ogni secondo
+            
+        except Exception as e:
+            logger.error(f"❌ Bandwidth calculator error: {e}")
+    
+    logger.info("🛑 Bandwidth calculator stopped")
+
+def start_bandwidth_calculator():
+    """Start the bandwidth calculation thread"""
+    global bandwidth_running, bandwidth_thread
+    
+    if bandwidth_running:
+        return
+    
+    bandwidth_running = True
+    bandwidth_thread = Thread(target=bandwidth_calculator, daemon=True)
+    bandwidth_thread.start()
+
+def stop_bandwidth_calculator():
+    """Stop the bandwidth calculation thread"""
+    global bandwidth_running
+    bandwidth_running = False
 
 def packet_sniffer():
     """Main packet sniffing thread"""
@@ -184,10 +272,10 @@ def packet_sniffer():
     interface = get_network_interface()
     
     if not interface:
-        print("❌ No network interface found!")
+        logger.error("❌ No network interface found!")
         return
     
-    print(f"🔍 Starting packet sniffer on interface: {interface}")
+    logger.info(f"🔍 Starting packet sniffer on interface: {interface}")
     
     try:
         sniff(
@@ -198,12 +286,15 @@ def packet_sniffer():
             stop_filter=lambda x: not sniffer_running
         )
     except PermissionError:
-        print("❌ Permission denied! Run as root/administrator")
+        logger.error("❌ Permission denied! Run as root/administrator")
+        logger.error("🔧 Try: sudo python3 app.py")
     except Exception as e:
-        print(f"❌ Sniffer error: {e}")
+        logger.error(f"❌ Sniffer error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         sniffer_running = False
-        print("🛑 Packet sniffer stopped")
+        logger.info("🛑 Packet sniffer stopped")
 
 def start_packet_sniffer():
     """Start the packet sniffing thread"""
@@ -253,49 +344,6 @@ def discover_devices():
             del discovered_devices[ip]
     
     return list(arp_devices.keys())
-
-def calculate_bandwidth_per_device(ip):
-    """Calculate REAL bandwidth per device based on packet capture"""
-    with sniffer_lock:
-        if ip not in device_traffic:
-            return 0, 0, 0  # total, sent, recv
-        
-        current_time = time.time()
-        prev_time = device_traffic[ip]['prev_time']
-        time_delta = current_time - prev_time
-        
-        if time_delta < 0.5:  # Avoid too frequent updates
-            # Return last calculated value
-            prev_total = device_traffic[ip].get('last_bandwidth_total', 0)
-            prev_sent = device_traffic[ip].get('last_bandwidth_sent', 0)
-            prev_recv = device_traffic[ip].get('last_bandwidth_recv', 0)
-            return prev_total, prev_sent, prev_recv
-        
-        # Calculate deltas
-        current_bytes_sent = device_traffic[ip]['bytes_sent']
-        current_bytes_recv = device_traffic[ip]['bytes_recv']
-        prev_bytes_sent = device_traffic[ip]['prev_bytes_sent']
-        prev_bytes_recv = device_traffic[ip]['prev_bytes_recv']
-        
-        bytes_sent_delta = current_bytes_sent - prev_bytes_sent
-        bytes_recv_delta = current_bytes_recv - prev_bytes_recv
-        
-        # Calculate bandwidth (bytes per second)
-        bandwidth_sent = bytes_sent_delta / time_delta
-        bandwidth_recv = bytes_recv_delta / time_delta
-        bandwidth_total = bandwidth_sent + bandwidth_recv
-        
-        # Update previous values
-        device_traffic[ip]['prev_bytes_sent'] = current_bytes_sent
-        device_traffic[ip]['prev_bytes_recv'] = current_bytes_recv
-        device_traffic[ip]['prev_time'] = current_time
-        
-        # Store last calculated bandwidth
-        device_traffic[ip]['last_bandwidth_total'] = bandwidth_total
-        device_traffic[ip]['last_bandwidth_sent'] = bandwidth_sent
-        device_traffic[ip]['last_bandwidth_recv'] = bandwidth_recv
-        
-        return max(0, bandwidth_total), max(0, bandwidth_sent), max(0, bandwidth_recv)
 
 def get_network_stats():
     """Get total network statistics"""
@@ -349,16 +397,17 @@ def get_connected_devices():
             hostname = device_info.get('hostname', f"Device-{ip.split('.')[-1]}")
             mac = device_info.get('mac', 'N/A')
             
-            # Get REAL traffic from sniffer
+            # Get traffic data (già calcolato dal bandwidth_calculator thread)
             with sniffer_lock:
                 traffic = device_traffic[ip]
                 bytes_sent = traffic['bytes_sent']
                 bytes_recv = traffic['bytes_recv']
                 packets_sent = traffic['packets_sent']
                 packets_recv = traffic['packets_recv']
+                bandwidth_total = traffic['bandwidth_total']
+                bandwidth_sent = traffic['bandwidth_sent']
+                bandwidth_recv = traffic['bandwidth_recv']
             
-            # Calculate REAL bandwidth
-            bandwidth_total, bandwidth_sent, bandwidth_recv = calculate_bandwidth_per_device(ip)
             total_bandwidth_all_devices += bandwidth_total
             
             devices.append({
@@ -396,7 +445,7 @@ def network_stats():
             'sniffer_active': sniffer_running
         })
     except Exception as e:
-        print(f"❌ Error: {e}")
+        logger.error(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -413,7 +462,36 @@ def health():
         'network': f'{network_prefix}.0/24',
         'interface': interface,
         'devices_discovered': len(discovered_devices),
-        'sniffer_running': sniffer_running
+        'sniffer_running': sniffer_running,
+        'bandwidth_calculator_running': bandwidth_running,
+        'packets_captured': packet_count
+    })
+
+@app.route('/api/debug', methods=['GET'])
+def debug():
+    """Debug endpoint to see raw traffic data"""
+    with sniffer_lock:
+        traffic_data = {
+            ip: {
+                'bytes_sent': data['bytes_sent'],
+                'bytes_recv': data['bytes_recv'],
+                'packets_sent': data['packets_sent'],
+                'packets_recv': data['packets_recv'],
+                'bandwidth_total': data['bandwidth_total'],
+                'bandwidth_sent': data['bandwidth_sent'],
+                'bandwidth_recv': data['bandwidth_recv'],
+                'last_update': data['last_update']
+            }
+            for ip, data in device_traffic.items()
+        }
+    
+    return jsonify({
+        'sniffer_running': sniffer_running,
+        'bandwidth_calculator_running': bandwidth_running,
+        'packet_count': packet_count,
+        'devices_in_traffic': len(device_traffic),
+        'traffic_data': traffic_data,
+        'discovered_devices': len(discovered_devices)
     })
 
 @app.route('/api/sniffer/start', methods=['POST'])
@@ -431,13 +509,17 @@ def stop_sniffer():
 @app.route('/api/clear-cache', methods=['POST'])
 def clear_cache():
     """Clear device cache and traffic stats"""
-    global discovered_devices, device_traffic
+    global discovered_devices, device_traffic, packet_count
     
     with devices_lock:
         discovered_devices.clear()
     
     with sniffer_lock:
         device_traffic.clear()
+    
+    packet_count = 0
+    
+    logger.info("🗑️ Cache cleared")
     
     return jsonify({'message': 'Cache cleared', 'status': 'ok'})
 
@@ -452,14 +534,22 @@ if __name__ == '__main__':
     
     # Start sniffer
     start_packet_sniffer()
-    time.sleep(1)
+    time.sleep(0.5)
+    
+    # Start bandwidth calculator
+    start_bandwidth_calculator()
+    time.sleep(0.5)
     
     print("=" * 70)
     print(f"✅ API: http://localhost:5000")
     print(f"📊 Dashboard: http://localhost:3000")
+    print(f"🔍 Debug: http://localhost:5000/api/debug")
+    print("=" * 70)
+    print("⚠️  Remember: Run with sudo for packet capture!")
     print("=" * 70)
     
     try:
         app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
     finally:
         stop_packet_sniffer()
+        stop_bandwidth_calculator()

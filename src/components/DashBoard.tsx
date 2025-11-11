@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
 import './Dashboard.css';
@@ -61,7 +61,7 @@ const Dashboard: React.FC = () => {
     { label: '10s', value: 10000 },
   ];
 
-  const fetchNetworkStats = async () => {
+  const fetchNetworkStats = useCallback(async () => {
     if (isPaused) return;
     
     try {
@@ -82,12 +82,12 @@ const Dashboard: React.FC = () => {
         timestamp: Date.now()
       };
       
-      const newAllIPs = new Set(allDeviceIPs);
       let currentMaxBandwidth = 0;
+      const newDeviceHostnames = new Set<string>();
       
       data.devices.forEach((device: Device) => {
         newDataPoint[device.hostname] = device.bandwidth_used;
-        newAllIPs.add(device.hostname);
+        newDeviceHostnames.add(device.hostname);
         
         // Track max bandwidth
         if (device.bandwidth_used > currentMaxBandwidth) {
@@ -95,16 +95,25 @@ const Dashboard: React.FC = () => {
         }
         
         // Auto-add devices with traffic to visible list
-        if (device.bandwidth_used > 0 && !visibleDevices.has(device.hostname)) {
-          setVisibleDevices(prev => new Set(prev).add(device.hostname));
+        if (device.bandwidth_used > 0) {
+          setVisibleDevices(prev => {
+            if (!prev.has(device.hostname)) {
+              const newSet = new Set(prev);
+              newSet.add(device.hostname);
+              return newSet;
+            }
+            return prev;
+          });
         }
       });
       
+      // Update all device IPs
+      setAllDeviceIPs(newDeviceHostnames);
+      
       // Update max bandwidth
-      setMaxBandwidth(Math.max(maxBandwidth, currentMaxBandwidth));
+      setMaxBandwidth(prev => Math.max(prev, currentMaxBandwidth));
       
-      setAllDeviceIPs(newAllIPs);
-      
+      // Update chart data
       setChartData(prevData => {
         const updatedData = [...prevData, newDataPoint];
         if (updatedData.length > MAX_DATA_POINTS) {
@@ -119,13 +128,13 @@ const Dashboard: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [isPaused]); // SOLO isPaused come dependency
 
   useEffect(() => {
     fetchNetworkStats();
     const interval = setInterval(fetchNetworkStats, refreshRate);
     return () => clearInterval(interval);
-  }, [refreshRate, isPaused]);
+  }, [refreshRate, fetchNetworkStats]); // refreshRate e fetchNetworkStats
 
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B';
@@ -346,7 +355,7 @@ const Dashboard: React.FC = () => {
         <div className="section-header">
           <div className="section-title">DATA STREAM ANALYSIS</div>
           <div className="section-meta">
-            {visibleDevices.size}/{allDeviceIPs.size} NODES VISIBLE · {refreshRate / 1000}S REFRESH
+            {visibleDevices.size}/{allDeviceIPs.size} NODES VISIBLE · {refreshRate / 1000}S REFRESH · {chartData.length} DATA POINTS
           </div>
         </div>
 
@@ -380,55 +389,68 @@ const Dashboard: React.FC = () => {
         </div>
         
         <div className="chart-container">
-          <ResponsiveContainer width="100%" height={500}>
-            <AreaChart data={chartData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
-              <defs>
-                {Array.from(allDeviceIPs).map((hostname, index) => (
-                  <linearGradient key={hostname} id={`gradient-${index}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]} stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]} stopOpacity={0}/>
-                  </linearGradient>
-                ))}
-              </defs>
-              <CartesianGrid strokeDasharray="0" stroke="#2a2a2a" strokeWidth={0.5} />
-              <XAxis 
-                dataKey="time" 
-                stroke="#666666" 
-                tick={{ fill: '#999999', fontSize: 11, fontFamily: 'SF Mono, monospace' }}
-                tickLine={false}
-                axisLine={{ stroke: '#333333' }}
-              />
-              <YAxis 
-                stroke="#666666"
-                tick={{ fill: '#999999', fontSize: 11, fontFamily: 'SF Mono, monospace' }}
-                tickLine={false}
-                axisLine={{ stroke: '#333333' }}
-                tickFormatter={(value) => formatBandwidth(value)}
-              />
-              <Tooltip content={<CustomTooltip />} />
-              <Legend 
-                wrapperStyle={{ display: 'none' }}
-              />
-              {Array.from(allDeviceIPs).map((hostname, index) => {
-                const isVisible = visibleDevices.has(hostname);
-                const isHovered = hoveredDevice === hostname;
-                
-                return (
-                  <Area
-                    key={hostname}
-                    type="monotone"
-                    dataKey={hostname}
-                    stroke={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]}
-                    strokeWidth={isHovered ? 4 : isVisible ? 2 : 0}
-                    fill={isVisible ? `url(#gradient-${index})` : 'none'}
-                    dot={false}
-                    activeDot={{ r: 6, fill: DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length], stroke: '#000', strokeWidth: 2 }}
-                    opacity={isVisible ? (isHovered ? 1 : 0.8) : 0}
-                  />
-                );
-              })}
-            </AreaChart>
-          </ResponsiveContainer>
+          {chartData.length === 0 ? (
+            <div style={{ 
+              height: '500px', 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center',
+              color: '#666',
+              fontSize: '14px'
+            }}>
+              Waiting for data...
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={500}>
+              <AreaChart data={chartData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                <defs>
+                  {Array.from(allDeviceIPs).map((hostname, index) => (
+                    <linearGradient key={hostname} id={`gradient-${index}`} x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]} stopOpacity={0.3}/>
+                      <stop offset="95%" stopColor={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]} stopOpacity={0}/>
+                    </linearGradient>
+                  ))}
+                </defs>
+                <CartesianGrid strokeDasharray="0" stroke="#2a2a2a" strokeWidth={0.5} />
+                <XAxis 
+                  dataKey="time" 
+                  stroke="#666666" 
+                  tick={{ fill: '#999999', fontSize: 11, fontFamily: 'SF Mono, monospace' }}
+                  tickLine={false}
+                  axisLine={{ stroke: '#333333' }}
+                />
+                <YAxis 
+                  stroke="#666666"
+                  tick={{ fill: '#999999', fontSize: 11, fontFamily: 'SF Mono, monospace' }}
+                  tickLine={false}
+                  axisLine={{ stroke: '#333333' }}
+                  tickFormatter={(value) => formatBandwidth(value)}
+                />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend 
+                  wrapperStyle={{ display: 'none' }}
+                />
+                {Array.from(allDeviceIPs).map((hostname, index) => {
+                  const isVisible = visibleDevices.has(hostname);
+                  const isHovered = hoveredDevice === hostname;
+                  
+                  return (
+                    <Area
+                      key={hostname}
+                      type="monotone"
+                      dataKey={hostname}
+                      stroke={DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length]}
+                      strokeWidth={isHovered ? 4 : isVisible ? 2 : 0}
+                      fill={isVisible ? `url(#gradient-${index})` : 'none'}
+                      dot={false}
+                      activeDot={{ r: 6, fill: DYSTOPIAN_COLORS[index % DYSTOPIAN_COLORS.length], stroke: '#000', strokeWidth: 2 }}
+                      opacity={isVisible ? (isHovered ? 1 : 0.8) : 0}
+                    />
+                  );
+                })}
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
         </div>
       </motion.section>
 
