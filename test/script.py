@@ -1,301 +1,391 @@
 #!/usr/bin/env python3
 """
-Network Maximum Bandwidth Calculator
-Calculates the theoretical maximum bandwidth of your network interface
+LAN Traffic Generator
+Generates massive traffic INSIDE your local network to test monitoring
 """
 
-import psutil
 import socket
-import subprocess
-import re
-import platform
+import threading
+import time
+import random
+import struct
 import sys
+from datetime import datetime
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+TARGET_IP = "192.168.1.100"  # ✅ CAMBIA CON IP DEL PC CHE MONITORA
+TARGET_PORT = 9999           # Porta per traffico TCP
+UDP_PORT = 9998              # Porta per traffico UDP
+
+NUM_TCP_THREADS = 10         # Thread TCP
+NUM_UDP_THREADS = 10         # Thread UDP
+PACKET_SIZE = 1024 * 64      # 64KB per packet
+PACKETS_PER_SECOND = 100     # Velocità invio
+
+# ============================================================================
+# TCP TRAFFIC GENERATOR
+# ============================================================================
+
+class TCPTrafficGenerator:
+    def __init__(self, target_ip, target_port, thread_id):
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.thread_id = thread_id
+        self.running = True
+        self.bytes_sent = 0
+        self.packets_sent = 0
+    
+    def generate_traffic(self):
+        """Genera traffico TCP continuo"""
+        while self.running:
+            try:
+                # Crea connessione TCP
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                
+                try:
+                    sock.connect((self.target_ip, self.target_port))
+                    print(f"✅ [TCP-{self.thread_id:02d}] Connected to {self.target_ip}:{self.target_port}")
+                except ConnectionRefusedError:
+                    # Normale se nessuno ascolta, continua a inviare
+                    pass
+                
+                # Invia pacchetti
+                for _ in range(PACKETS_PER_SECOND):
+                    if not self.running:
+                        break
+                    
+                    # Genera dati casuali
+                    data = random.randbytes(PACKET_SIZE)
+                    
+                    try:
+                        sock.sendall(data)
+                        self.bytes_sent += len(data)
+                        self.packets_sent += 1
+                    except:
+                        break
+                    
+                    time.sleep(1.0 / PACKETS_PER_SECOND)
+                
+                sock.close()
+                
+            except Exception as e:
+                print(f"⚠️  [TCP-{self.thread_id:02d}] Error: {e}")
+                time.sleep(1)
+    
+    def start(self):
+        """Avvia thread"""
+        thread = threading.Thread(target=self.generate_traffic, daemon=True)
+        thread.start()
+        return thread
+
+# ============================================================================
+# UDP TRAFFIC GENERATOR
+# ============================================================================
+
+class UDPTrafficGenerator:
+    def __init__(self, target_ip, target_port, thread_id):
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.thread_id = thread_id
+        self.running = True
+        self.bytes_sent = 0
+        self.packets_sent = 0
+    
+    def generate_traffic(self):
+        """Genera traffico UDP continuo"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        print(f"✅ [UDP-{self.thread_id:02d}] Sending to {self.target_ip}:{self.target_port}")
+        
+        while self.running:
+            try:
+                # Genera dati casuali
+                data = random.randbytes(PACKET_SIZE)
+                
+                # Invia UDP packet
+                sock.sendto(data, (self.target_ip, self.target_port))
+                
+                self.bytes_sent += len(data)
+                self.packets_sent += 1
+                
+                time.sleep(1.0 / PACKETS_PER_SECOND)
+                
+            except Exception as e:
+                print(f"⚠️  [UDP-{self.thread_id:02d}] Error: {e}")
+                time.sleep(1)
+        
+        sock.close()
+    
+    def start(self):
+        """Avvia thread"""
+        thread = threading.Thread(target=self.generate_traffic, daemon=True)
+        thread.start()
+        return thread
+
+# ============================================================================
+# HTTP TRAFFIC GENERATOR (LAN)
+# ============================================================================
+
+class HTTPTrafficGenerator:
+    def __init__(self, target_ip, thread_id):
+        self.target_ip = target_ip
+        self.thread_id = thread_id
+        self.running = True
+        self.requests_sent = 0
+    
+    def generate_traffic(self):
+        """Genera richieste HTTP verso IP nella LAN"""
+        while self.running:
+            try:
+                # Prova a connettersi su porte comuni
+                ports = [80, 8080, 5000, 3000, 5173, 8000]
+                port = random.choice(ports)
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                
+                try:
+                    sock.connect((self.target_ip, port))
+                    
+                    # Invia richiesta HTTP
+                    request = f"GET / HTTP/1.1\r\nHost: {self.target_ip}\r\n\r\n"
+                    sock.sendall(request.encode())
+                    
+                    # Ricevi risposta (crea traffico bidirezionale)
+                    try:
+                        data = sock.recv(4096)
+                        self.requests_sent += 1
+                        print(f"✅ [HTTP-{self.thread_id:02d}] Request to {self.target_ip}:{port} - {len(data)} bytes received")
+                    except:
+                        pass
+                    
+                except:
+                    # Porta chiusa, continua
+                    pass
+                finally:
+                    sock.close()
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                time.sleep(1)
+    
+    def start(self):
+        """Avvia thread"""
+        thread = threading.Thread(target=self.generate_traffic, daemon=True)
+        thread.start()
+        return thread
+
+# ============================================================================
+# PING GENERATOR (ICMP)
+# ============================================================================
+
+class PingGenerator:
+    def __init__(self, target_ip, thread_id):
+        self.target_ip = target_ip
+        self.thread_id = thread_id
+        self.running = True
+    
+    def generate_traffic(self):
+        """Genera ping continui"""
+        import subprocess
+        import platform
+        
+        system = platform.system().lower()
+        
+        while self.running:
+            try:
+                if system == 'windows':
+                    # Windows: ping -n 1
+                    result = subprocess.run(
+                        ['ping', '-n', '1', self.target_ip],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2
+                    )
+                else:
+                    # Linux: ping -c 1
+                    result = subprocess.run(
+                        ['ping', '-c', '1', self.target_ip],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2
+                    )
+                
+                if result.returncode == 0:
+                    print(f"✅ [PING-{self.thread_id:02d}] Ping to {self.target_ip} successful")
+                
+                time.sleep(0.1)  # Ping veloce
+                
+            except Exception as e:
+                time.sleep(1)
+    
+    def start(self):
+        """Avvia thread"""
+        thread = threading.Thread(target=self.generate_traffic, daemon=True)
+        thread.start()
+        return thread
+
+# ============================================================================
+# STATISTICS MONITOR
+# ============================================================================
+
+class StatsMonitor:
+    def __init__(self, generators):
+        self.generators = generators
+        self.running = True
+        self.start_time = time.time()
+    
+    def monitor(self):
+        """Monitora statistiche"""
+        while self.running:
+            time.sleep(5)
+            
+            total_bytes = 0
+            total_packets = 0
+            total_requests = 0
+            
+            for gen in self.generators:
+                if hasattr(gen, 'bytes_sent'):
+                    total_bytes += gen.bytes_sent
+                if hasattr(gen, 'packets_sent'):
+                    total_packets += gen.packets_sent
+                if hasattr(gen, 'requests_sent'):
+                    total_requests += gen.requests_sent
+            
+            elapsed = time.time() - self.start_time
+            bandwidth = (total_bytes / elapsed) / (1024 * 1024)  # MB/s
+            
+            print("\n" + "=" * 70)
+            print(f"📊 STATISTICS [{datetime.now().strftime('%H:%M:%S')}]")
+            print("=" * 70)
+            print(f"   Running time:     {int(elapsed)}s")
+            print(f"   Total sent:       {total_bytes / (1024*1024):.2f} MB")
+            print(f"   Total packets:    {total_packets}")
+            print(f"   HTTP requests:    {total_requests}")
+            print(f"   Average speed:    {bandwidth:.2f} MB/s")
+            print("=" * 70 + "\n")
+    
+    def start(self):
+        """Avvia thread"""
+        thread = threading.Thread(target=self.monitor, daemon=True)
+        thread.start()
+        return thread
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def print_banner():
+    """Stampa banner"""
+    print("\n" + "=" * 70)
+    print("  🔥 LAN TRAFFIC GENERATOR 🔥".center(70))
+    print("=" * 70)
+    print()
 
 def get_local_ip():
-    """Get the local IP address of the machine"""
+    """Ottiene IP locale"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except Exception:
-        return "127.0.0.1"
-
-def get_active_interface():
-    """Get the active network interface name"""
-    try:
-        local_ip = get_local_ip()
-        
-        for interface, addrs in psutil.net_if_addrs().items():
-            for addr in addrs:
-                if addr.family == socket.AF_INET and addr.address == local_ip:
-                    return interface
-    except Exception as e:
-        print(f"❌ Error: {e}")
-    
-    return None
-
-def get_interface_speed_linux(interface):
-    """Get interface speed on Linux in Mbps"""
-    try:
-        # Try ethtool first (most accurate)
-        result = subprocess.run(
-            ['ethtool', interface],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        
-        if result.returncode == 0:
-            # Look for "Speed: 1000Mb/s" or similar
-            match = re.search(r'Speed:\s*(\d+)Mb/s', result.stdout)
-            if match:
-                return int(match.group(1))
-        
-        # Fallback: read from /sys/class/net
-        with open(f'/sys/class/net/{interface}/speed', 'r') as f:
-            speed = int(f.read().strip())
-            return speed if speed > 0 else None
-            
-    except FileNotFoundError:
-        print(f"⚠️  Install ethtool for accurate results: sudo apt install ethtool")
-    except Exception:
-        pass
-    
-    return None
-
-def get_interface_speed_windows(interface):
-    """Get interface speed on Windows in Mbps"""
-    try:
-        result = subprocess.run(
-            ['powershell', '-Command', 
-             f'Get-NetAdapter -Name "{interface}" | Select-Object -ExpandProperty LinkSpeed'],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        
-        if result.returncode == 0:
-            # Output like "1 Gbps" or "100 Mbps"
-            output = result.stdout.strip()
-            
-            if 'Gbps' in output:
-                match = re.search(r'(\d+(?:\.\d+)?)\s*Gbps', output)
-                if match:
-                    return int(float(match.group(1)) * 1000)
-            
-            if 'Mbps' in output:
-                match = re.search(r'(\d+(?:\.\d+)?)\s*Mbps', output)
-                if match:
-                    return int(float(match.group(1)))
-    
-    except Exception:
-        pass
-    
-    return None
-
-def get_interface_speed_mac(interface):
-    """Get interface speed on macOS in Mbps"""
-    try:
-        result = subprocess.run(
-            ['networksetup', '-getmedia', interface],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        
-        if result.returncode == 0:
-            # Look for speed in output
-            match = re.search(r'(\d+)(baseT|G)', result.stdout)
-            if match:
-                speed = int(match.group(1))
-                unit = match.group(2)
-                
-                if unit == 'G':
-                    return speed * 1000
-                else:
-                    return speed
-    
-    except Exception:
-        pass
-    
-    return None
-
-def get_max_bandwidth(interface):
-    """Get maximum theoretical bandwidth for the interface"""
-    system = platform.system().lower()
-    
-    if system == 'linux':
-        speed_mbps = get_interface_speed_linux(interface)
-    elif system == 'windows':
-        speed_mbps = get_interface_speed_windows(interface)
-    elif system == 'darwin':  # macOS
-        speed_mbps = get_interface_speed_mac(interface)
-    else:
-        speed_mbps = None
-    
-    return speed_mbps
-
-def format_speed(mbps):
-    """Format speed in human-readable format"""
-    if mbps is None:
+    except:
         return "Unknown"
-    
-    if mbps >= 1000:
-        return f"{mbps / 1000:.1f} Gbps"
-    else:
-        return f"{mbps} Mbps"
-
-def calculate_max_throughput(mbps):
-    """Calculate theoretical maximum throughput in different units"""
-    if mbps is None:
-        return None
-    
-    # Convert Mbps to bits per second
-    bits_per_sec = mbps * 1_000_000
-    
-    # Convert to bytes per second (divide by 8)
-    bytes_per_sec = bits_per_sec / 8
-    
-    return {
-        'bits_per_sec': bits_per_sec,
-        'bytes_per_sec': bytes_per_sec,
-        'KB_per_sec': bytes_per_sec / 1024,
-        'MB_per_sec': bytes_per_sec / (1024 * 1024),
-        'GB_per_sec': bytes_per_sec / (1024 * 1024 * 1024)
-    }
-
-def get_interface_stats(interface):
-    """Get current interface statistics"""
-    try:
-        stats = psutil.net_io_counters(pernic=True).get(interface)
-        if stats:
-            return {
-                'bytes_sent': stats.bytes_sent,
-                'bytes_recv': stats.bytes_recv,
-                'packets_sent': stats.packets_sent,
-                'packets_recv': stats.packets_recv,
-                'errin': stats.errin,
-                'errout': stats.errout,
-                'dropin': stats.dropin,
-                'dropout': stats.dropout
-            }
-    except Exception:
-        pass
-    
-    return None
-
-def format_bytes(bytes_val):
-    """Format bytes in human-readable format"""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024.0:
-            return f"{bytes_val:.2f} {unit}"
-        bytes_val /= 1024.0
-    return f"{bytes_val:.2f} PB"
 
 def main():
-    print("=" * 70)
-    print("🌐 NETWORK MAXIMUM BANDWIDTH CALCULATOR")
-    print("=" * 70)
-    print()
+    print_banner()
     
-    # Get active interface
-    interface = get_active_interface()
     local_ip = get_local_ip()
     
-    if not interface:
-        print("❌ Could not detect active network interface!")
-        sys.exit(1)
-    
-    print(f"📡 Local IP:       {local_ip}")
-    print(f"🔌 Interface:      {interface}")
+    print(f"⚙️  Configuration:")
+    print(f"   Source IP:        {local_ip}")
+    print(f"   Target IP:        {TARGET_IP}")
+    print(f"   TCP Port:         {TARGET_PORT}")
+    print(f"   UDP Port:         {UDP_PORT}")
+    print(f"   TCP Threads:      {NUM_TCP_THREADS}")
+    print(f"   UDP Threads:      {NUM_UDP_THREADS}")
+    print(f"   Packet size:      {PACKET_SIZE / 1024:.0f} KB")
+    print(f"   Packets/sec:      {PACKETS_PER_SECOND}")
     print()
-    
-    # Get maximum bandwidth
-    max_speed_mbps = get_max_bandwidth(interface)
-    
-    if max_speed_mbps is None:
-        print("⚠️  Could not determine interface speed automatically")
-        print("   This might require root/admin privileges")
-        print()
-        
-        if platform.system().lower() == 'linux':
-            print("💡 Try: sudo python3 max_bandwidth.py")
-            print("   or: sudo apt install ethtool")
-        
-        sys.exit(1)
-    
-    print("=" * 70)
-    print("📊 MAXIMUM THEORETICAL BANDWIDTH")
-    print("=" * 70)
+    print(f"💡 Dashboard: http://{TARGET_IP}:5173")
     print()
-    print(f"Link Speed:        {format_speed(max_speed_mbps)}")
-    print()
+    print("⚠️  This device will generate MASSIVE traffic to target!")
+    print("=" * 70 + "\n")
     
-    # Calculate throughput
-    throughput = calculate_max_throughput(max_speed_mbps)
+    try:
+        input("Press ENTER to start or Ctrl+C to cancel...")
+    except KeyboardInterrupt:
+        print("\nCancelled!")
+        return
     
-    if throughput:
-        print("Maximum Throughput (Theoretical):")
-        print(f"  • Bits/sec:      {throughput['bits_per_sec']:,.0f} bps")
-        print(f"  • Bytes/sec:     {throughput['bytes_per_sec']:,.0f} B/s")
-        print(f"  • Kilobytes/sec: {throughput['KB_per_sec']:,.2f} KB/s")
-        print(f"  • Megabytes/sec: {throughput['MB_per_sec']:,.2f} MB/s")
+    print("\n🚀 Starting traffic generation...\n")
+    
+    generators = []
+    threads = []
+    
+    try:
+        # Start TCP generators
+        for i in range(NUM_TCP_THREADS):
+            gen = TCPTrafficGenerator(TARGET_IP, TARGET_PORT, i)
+            generators.append(gen)
+            threads.append(gen.start())
+        print(f"✅ Started {NUM_TCP_THREADS} TCP threads")
         
-        if throughput['GB_per_sec'] >= 0.01:
-            print(f"  • Gigabytes/sec: {throughput['GB_per_sec']:,.3f} GB/s")
+        # Start UDP generators
+        for i in range(NUM_UDP_THREADS):
+            gen = UDPTrafficGenerator(TARGET_IP, UDP_PORT, i)
+            generators.append(gen)
+            threads.append(gen.start())
+        print(f"✅ Started {NUM_UDP_THREADS} UDP threads")
         
-        print()
-        print(f"Maximum Download:  ~{throughput['MB_per_sec']:,.1f} MB/s")
-        print(f"Maximum Upload:    ~{throughput['MB_per_sec']:,.1f} MB/s")
-        print()
-    
-    # Get current stats
-    stats = get_interface_stats(interface)
-    
-    if stats:
+        # Start HTTP generators
+        for i in range(5):
+            gen = HTTPTrafficGenerator(TARGET_IP, i)
+            generators.append(gen)
+            threads.append(gen.start())
+        print(f"✅ Started 5 HTTP threads")
+        
+        # Start Ping generators
+        for i in range(3):
+            gen = PingGenerator(TARGET_IP, i)
+            threads.append(gen.start())
+        print(f"✅ Started 3 PING threads")
+        
+        # Start stats monitor
+        monitor = StatsMonitor(generators)
+        threads.append(monitor.start())
+        
+        print("\n" + "=" * 70)
+        print("💡 Check your dashboard to see THIS device traffic spike!")
         print("=" * 70)
-        print("📈 CURRENT INTERFACE STATISTICS")
-        print("=" * 70)
-        print()
-        print(f"Total Sent:        {format_bytes(stats['bytes_sent'])}")
-        print(f"Total Received:    {format_bytes(stats['bytes_recv'])}")
-        print(f"Packets Sent:      {stats['packets_sent']:,}")
-        print(f"Packets Received:  {stats['packets_recv']:,}")
+        print("Press Ctrl+C to stop...\n")
         
-        if stats['errin'] > 0 or stats['errout'] > 0:
-            print()
-            print(f"⚠️  Errors In:      {stats['errin']:,}")
-            print(f"⚠️  Errors Out:     {stats['errout']:,}")
+        # Keep running
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n\n🛑 Stopping all traffic generators...")
         
-        if stats['dropin'] > 0 or stats['dropout'] > 0:
-            print(f"⚠️  Dropped In:     {stats['dropin']:,}")
-            print(f"⚠️  Dropped Out:    {stats['dropout']:,}")
+        # Stop generators
+        for gen in generators:
+            gen.running = False
         
-        print()
-    
-    print("=" * 70)
-    print("ℹ️  NOTES:")
-    print("=" * 70)
-    print("• Theoretical maximum assumes:")
-    print("  - Perfect conditions (no interference, no errors)")
-    print("  - Full duplex operation")
-    print("  - No protocol overhead")
-    print()
-    print("• Real-world speeds are typically 70-95% of theoretical max")
-    print("• WiFi speeds vary based on distance, interference, and congestion")
-    print("• Check your ISP plan - it may be slower than your network card")
-    print("=" * 70)
+        if 'monitor' in locals():
+            monitor.running = False
+        
+        time.sleep(2)
+        print("✅ All traffic stopped!")
+        
+        # Final stats
+        total_bytes = sum(gen.bytes_sent for gen in generators if hasattr(gen, 'bytes_sent'))
+        print(f"\n📊 Total data sent: {total_bytes / (1024*1024):.2f} MB")
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    main()

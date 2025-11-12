@@ -10,10 +10,11 @@ import re
 import platform
 from threading import Lock, Thread
 import logging
+import os
 
 # Import Scapy per packet capture
 try:
-    from scapy.all import sniff, IP, get_if_list
+    from scapy.all import sniff, IP, conf
     SCAPY_AVAILABLE = True
 except ImportError:
     SCAPY_AVAILABLE = False
@@ -87,6 +88,13 @@ scanner_thread = None
 scanner_running = False
 
 
+def check_root_privileges():
+    """Check if running with root privileges (required for packet capture on Linux)"""
+    if platform.system() == 'Linux':
+        return os.geteuid() == 0
+    return True
+
+
 def get_local_ip():
     """Get the local IP address of the machine"""
     try:
@@ -95,7 +103,8 @@ def get_local_ip():
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error getting local IP: {e}")
         return "127.0.0.1"
 
 
@@ -107,20 +116,38 @@ def get_network_prefix():
 
 
 def get_network_interface():
-    """Get the active network interface"""
+    """Get the active network interface - Linux optimized"""
     try:
         local_ip = get_local_ip()
         
+        # Method 1: Check psutil interfaces
         for interface, addrs in psutil.net_if_addrs().items():
             for addr in addrs:
                 if addr.family == socket.AF_INET and addr.address == local_ip:
+                    logger.info(f"✅ Found interface: {interface} ({local_ip})")
                     return interface
         
-        if SCAPY_AVAILABLE:
-            interfaces = get_if_list()
-            for iface in interfaces:
-                if 'Loopback' not in iface and 'lo' not in iface.lower():
-                    return iface
+        # Method 2: Use ip route command (Linux)
+        if platform.system() == 'Linux':
+            try:
+                output = subprocess.check_output(
+                    "ip route get 8.8.8.8 | awk '{print $5; exit}'",
+                    shell=True,
+                    timeout=2
+                ).decode('utf-8').strip()
+                
+                if output and output != '':
+                    logger.info(f"✅ Found interface via ip route: {output}")
+                    return output
+            except Exception as e:
+                logger.warning(f"ip route failed: {e}")
+        
+        # Method 3: Get default interface from psutil
+        stats = psutil.net_if_stats()
+        for iface, stat in stats.items():
+            if stat.isup and iface not in ['lo', 'lo0']:
+                logger.info(f"✅ Using interface: {iface}")
+                return iface
                     
     except Exception as e:
         logger.error(f"⚠️ Error getting network interface: {e}")
@@ -129,21 +156,58 @@ def get_network_interface():
 
 
 def get_mac_address(ip):
-    """Get MAC address for an IP using ARP"""
+    """Get MAC address for an IP using ARP - Linux optimized"""
     try:
-        output = subprocess.check_output(
-            f"arp -a {ip}",
-            shell=True,
-            timeout=1,
-            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
-        ).decode('utf-8', errors='ignore')
+        system = platform.system().lower()
         
-        mac_pattern = r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})"
-        match = re.search(mac_pattern, output)
-        if match:
-            return match.group(0).replace('-', ':').upper()
-    except:
-        pass
+        if system == 'linux':
+            # Try ip neighbor first (modern Linux)
+            try:
+                output = subprocess.check_output(
+                    f"ip neighbor show {ip}",
+                    shell=True,
+                    timeout=1,
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8', errors='ignore')
+                
+                mac_pattern = r"([0-9a-fA-F]{2}[:]){5}([0-9a-fA-F]{2})"
+                match = re.search(mac_pattern, output)
+                if match:
+                    return match.group(0).upper()
+            except:
+                pass
+            
+            # Fallback to arp
+            try:
+                output = subprocess.check_output(
+                    f"arp -n {ip}",
+                    shell=True,
+                    timeout=1,
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8', errors='ignore')
+                
+                mac_pattern = r"([0-9a-fA-F]{2}[:]){5}([0-9a-fA-F]{2})"
+                match = re.search(mac_pattern, output)
+                if match:
+                    return match.group(0).upper()
+            except:
+                pass
+        
+        else:  # Windows
+            output = subprocess.check_output(
+                f"arp -a {ip}",
+                shell=True,
+                timeout=1,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            ).decode('utf-8', errors='ignore')
+            
+            mac_pattern = r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})"
+            match = re.search(mac_pattern, output)
+            if match:
+                return match.group(0).replace('-', ':').upper()
+    
+    except Exception as e:
+        logger.debug(f"MAC lookup failed for {ip}: {e}")
     
     return "N/A"
 
@@ -161,14 +225,66 @@ def get_hostname_by_ip(ip):
 
 
 def get_arp_table():
-    """Get all devices from ARP table"""
+    """Get all devices from ARP table - Linux optimized"""
     devices_info = {}
     network_prefix = get_network_prefix()
     
     try:
         system = platform.system().lower()
         
-        if system == "windows":
+        if system == "linux":
+            # Try ip neighbor first (modern)
+            try:
+                output = subprocess.check_output(
+                    "ip neighbor show",
+                    shell=True,
+                    timeout=2,
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8', errors='ignore')
+                
+                # Format: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+                lines = output.strip().split('\n')
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        ip = parts[0]
+                        if 'lladdr' in parts:
+                            mac_idx = parts.index('lladdr') + 1
+                            if mac_idx < len(parts):
+                                mac = parts[mac_idx]
+                                if ip.startswith(f'{network_prefix}.') and not ip.endswith('.255'):
+                                    devices_info[ip] = mac.upper()
+                
+                if devices_info:
+                    logger.info(f"✅ ip neighbor found {len(devices_info)} devices")
+                    return devices_info
+            
+            except Exception as e:
+                logger.debug(f"ip neighbor failed: {e}")
+            
+            # Fallback to arp -n
+            try:
+                output = subprocess.check_output(
+                    "arp -n",
+                    shell=True,
+                    timeout=2,
+                    stderr=subprocess.DEVNULL
+                ).decode('utf-8', errors='ignore')
+                
+                # Format: 192.168.1.1    ether   aa:bb:cc:dd:ee:ff   C   eth0
+                pattern = r"(\d+\.\d+\.\d+\.\d+)\s+\w+\s+([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})"
+                matches = re.findall(pattern, output)
+                
+                for ip, mac in matches:
+                    if ip.startswith(f'{network_prefix}.') and not ip.endswith('.255'):
+                        devices_info[ip] = mac.upper()
+                
+                logger.info(f"✅ arp found {len(devices_info)} devices")
+            
+            except Exception as e:
+                logger.warning(f"arp -n failed: {e}")
+        
+        else:  # Windows
             output = subprocess.check_output(
                 "arp -a",
                 shell=True,
@@ -182,18 +298,6 @@ def get_arp_table():
             for ip, mac in matches:
                 if ip.startswith(f'{network_prefix}.') and not ip.endswith('.255'):
                     devices_info[ip] = mac.replace('-', ':').upper()
-        else:
-            try:
-                output = subprocess.check_output("arp -an", shell=True, timeout=2).decode('utf-8', errors='ignore')
-            except:
-                output = subprocess.check_output("ip neighbor show", shell=True, timeout=2).decode('utf-8', errors='ignore')
-            
-            pattern = r"(\d+\.\d+\.\d+\.\d+).*?([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})"
-            matches = re.findall(pattern, output)
-            
-            for ip, mac in matches:
-                if ip.startswith(f'{network_prefix}.') and not ip.endswith('.255'):
-                    devices_info[ip] = mac.upper()
                     
     except Exception as e:
         logger.error(f"⚠️ ARP table error: {e}")
@@ -212,13 +316,17 @@ def quick_scan_and_resolve():
     arp_devices = get_arp_table()
     local_ip = get_local_ip()
     if local_ip not in arp_devices:
-        arp_devices[local_ip] = get_mac_address(local_ip)
+        mac = get_mac_address(local_ip)
+        if mac != "N/A":
+            arp_devices[local_ip] = mac
+    
+    logger.info(f"📋 ARP table: {len(arp_devices)} devices")
     
     # 2. Update discovered devices
     with devices_lock:
         with packet_lock:
             # Per ogni IP con traffico, resolve hostname se non già fatto
-            for ip in device_traffic.keys():
+            for ip in list(device_traffic.keys()):
                 if device_traffic[ip]['hostname'] is None:
                     mac = arp_devices.get(ip, get_mac_address(ip))
                     hostname = get_hostname_by_ip(ip)
@@ -241,6 +349,20 @@ def quick_scan_and_resolve():
                 else:
                     discovered_devices[ip]['last_seen'] = current_time
                     discovered_devices[ip]['is_active'] = True
+            
+            # Add devices from ARP that aren't in traffic yet
+            for ip, mac in arp_devices.items():
+                if ip not in discovered_devices:
+                    hostname = get_hostname_by_ip(ip)
+                    discovered_devices[ip] = {
+                        'ip': ip,
+                        'mac': mac,
+                        'hostname': hostname,
+                        'last_seen': current_time,
+                        'is_active': True,
+                        'first_seen': current_time
+                    }
+                    logger.info(f"🆕 New device from ARP: {hostname} ({ip})")
     
     last_quick_scan = current_time
     logger.info(f"✅ Quick scan complete: {len(discovered_devices)} devices")
@@ -256,7 +378,9 @@ def deep_scan():
     # ARP scan completo
     arp_devices = get_arp_table()
     local_ip = get_local_ip()
-    arp_devices[local_ip] = get_mac_address(local_ip)
+    mac = get_mac_address(local_ip)
+    if mac != "N/A":
+        arp_devices[local_ip] = mac
     
     with devices_lock:
         for ip, mac in arp_devices.items():
@@ -293,7 +417,10 @@ def device_scanner_thread():
     logger.info("🔄 Device scanner thread started")
     
     # ✅ Initial QUICK scan (immediato)
-    quick_scan_and_resolve()
+    try:
+        quick_scan_and_resolve()
+    except Exception as e:
+        logger.error(f"Initial scan failed: {e}")
     
     while scanner_running:
         try:
@@ -357,15 +484,17 @@ def packet_callback(packet):
                     device_traffic[src_ip]['bytes_sent'] += packet_size
                     device_traffic[src_ip]['packets_sent'] += 1
                     device_traffic[src_ip]['last_seen'] = time.time()
+                    device_traffic[src_ip]['is_active'] = True
                 
                 # Traffico in ENTRATA
                 if dst_ip.startswith(f'{network_prefix}.'):
                     device_traffic[dst_ip]['bytes_recv'] += packet_size
                     device_traffic[dst_ip]['packets_recv'] += 1
                     device_traffic[dst_ip]['last_seen'] = time.time()
+                    device_traffic[dst_ip]['is_active'] = True
                     
     except Exception as e:
-        logger.error(f"❌ Packet callback error: {e}")
+        logger.debug(f"Packet callback error: {e}")
 
 
 def packet_sniffer():
@@ -374,6 +503,11 @@ def packet_sniffer():
     
     if not SCAPY_AVAILABLE:
         logger.error("❌ Scapy not available!")
+        return
+    
+    if not check_root_privileges():
+        logger.error("❌ Root privileges required for packet capture!")
+        logger.error("   Run with: sudo python3 app.py")
         return
     
     interface = get_network_interface()
@@ -385,6 +519,10 @@ def packet_sniffer():
     logger.info(f"🔍 Starting packet sniffer on: {interface}")
     
     try:
+        # Configure scapy for Linux
+        if platform.system() == 'Linux':
+            conf.use_pcap = False  # Use native Linux sockets
+        
         sniff(
             iface=interface,
             prn=packet_callback,
@@ -394,7 +532,7 @@ def packet_sniffer():
         )
         
     except PermissionError:
-        logger.error("❌ Permission denied! Run as Administrator")
+        logger.error("❌ Permission denied! Run with: sudo python3 app.py")
     except Exception as e:
         logger.error(f"❌ Sniffer error: {e}")
         import traceback
@@ -455,6 +593,10 @@ def start_packet_sniffer():
     
     if not SCAPY_AVAILABLE:
         logger.error("❌ Scapy not installed")
+        return False
+    
+    if not check_root_privileges():
+        logger.error("❌ Root privileges required!")
         return False
     
     if sniffer_running:
@@ -579,6 +721,7 @@ def network_stats():
             'scanner_active': scanner_running,
             'packets_captured': packet_count,
             'scapy_available': SCAPY_AVAILABLE,
+            'has_root': check_root_privileges(),
             'last_deep_scan': datetime.fromtimestamp(last_deep_scan).isoformat() if last_deep_scan > 0 else None,
             'next_deep_scan_in': int(DEEP_SCAN_INTERVAL - (time.time() - last_deep_scan)) if last_deep_scan > 0 else 0
         })
@@ -602,6 +745,7 @@ def health():
         'sniffer_running': sniffer_running,
         'scanner_running': scanner_running,
         'scapy_available': SCAPY_AVAILABLE,
+        'has_root': check_root_privileges(),
         'packets_captured': packet_count
     })
 
@@ -631,6 +775,7 @@ def debug():
     return jsonify({
         'platform': platform.system(),
         'scapy_available': SCAPY_AVAILABLE,
+        'has_root': check_root_privileges(),
         'sniffer_running': sniffer_running,
         'scanner_running': scanner_running,
         'packets_captured': packet_count,
@@ -664,7 +809,7 @@ def clear_cache():
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("🚀 NETWORK MONITOR v4.3 - QUICK SCAN FIXED")
+    print("🚀 NETWORK MONITOR v4.4 - LINUX OPTIMIZED")
     print("=" * 70)
     print(f"💻 Platform: {platform.system()} {platform.release()}")
     print(f"📡 Local IP: {get_local_ip()}")
@@ -672,10 +817,19 @@ if __name__ == '__main__':
     print(f"🔌 Interface: {get_network_interface()}")
     print()
     
+    # Check privileges
+    if not check_root_privileges():
+        print("⚠️  WARNING: Not running as root!")
+        print("   Packet capture will NOT work")
+        print("   Run with: sudo python3 app.py")
+        print()
+    else:
+        print("✅ Running with root privileges")
+    
     if SCAPY_AVAILABLE:
         print("✅ Scapy available - Real packet capture enabled")
     else:
-        print("❌ Scapy NOT available")
+        print("❌ Scapy NOT available - Install with: sudo pip3 install scapy")
     
     print()
     
@@ -690,28 +844,35 @@ if __name__ == '__main__':
             previous_interface_stats['packets_recv'] = net_io.packets_recv
             previous_interface_stats['time'] = time.time()
     
-    # Start packet sniffer
-    if SCAPY_AVAILABLE:
+    # Start packet sniffer (requires root)
+    if SCAPY_AVAILABLE and check_root_privileges():
         if start_packet_sniffer():
             print("✅ Packet sniffer started")
+        else:
+            print("❌ Packet sniffer failed to start")
     time.sleep(0.5)
     
     # Start bandwidth calculator
     start_bandwidth_calculator()
+    print("✅ Bandwidth calculator started")
     time.sleep(0.5)
     
-    # Start device scanner (con quick scan immediato)
+    # Start device scanner (works without root)
     start_device_scanner()
+    print("✅ Device scanner started")
     time.sleep(1)
     
     print("=" * 70)
     print(f"✅ API: http://localhost:5000")
     print(f"📊 Dashboard: http://localhost:3000")
     print(f"🔍 Debug: http://localhost:5000/api/debug")
+    print(f"💓 Health: http://localhost:5000/api/health")
     print("=" * 70)
     
-    if platform.system() == 'Windows':
-        print("⚠️  WINDOWS: Run as Administrator!")
+    if platform.system() == 'Linux' and not check_root_privileges():
+        print()
+        print("⚠️  For full functionality, restart with:")
+        print("   sudo python3 app.py")
     
     print("=" * 70)
     
